@@ -46,7 +46,7 @@ The log deliberately carries nothing but the turn number. Summaries, snapshot tr
 
 ## Consequences
 
-Every turn with tool results costs two snapshots and one diff on the Host, and writes blob and tree objects for the changed files into the Session's temporary directory, which disposal removes. Edits the user makes during a turn are attributed to it. Every file-tool edit also copies its whole file into that directory once per turn.
+Every turn with tool results costs two snapshots and one diff on the Host, and writes blob and tree objects for the changed files into the Session's temporary directory, which disposal removes. Edits the user makes during a turn are attributed to it. A turn whose window overlaps another Session's turn on the same repository instead lists its own file-tool edits alone: a tree diff reports what changed, never which Session changed it, so nothing a snapshot alone would attribute is claimed while two Sessions share the repository. Every file-tool edit also copies its whole file into that directory once per turn.
 
 The Web bundle alone mounts the recorder, so headless, SDK, and ACP logs are unchanged; recorded Web scenarios gain the event and the card whenever a turn changes a file; one dedicated scenario seeds a git repository so the card also carries a shell edit, while the others list their file-tool writes alone. The card replaces the Chinese and English "Files changed" row; prose file mentions still resolve against mutation-call paths and deliveries.
 

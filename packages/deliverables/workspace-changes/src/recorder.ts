@@ -9,12 +9,15 @@ import {
   blobText, diffTrees, gitlinkPaths, ignoredPaths, locateGitWorkspace, snapshotTree, treeBlob, type GitRunner, type GitWorkspace,
 } from './git.ts'
 import { canonicalPath, compareDisplay, displayPathOf, durablePathOf, isInside, isTemporaryPath, temporaryRoots, toPosix } from './paths.ts'
+import type { RepositoryTurns } from './turns.ts'
 import type { WorkspaceChangedFile, WorkspaceChangesSummary, WorkspaceFileDiff } from './types.ts'
 
 /** Facts shared by every recorder of one plugin instance. */
 export interface RecorderEnvironment {
   /** Resolves to the runner, or null when git is unavailable and no snapshot is taken. */
   git: Promise<GitRunner | null>
+  /** The live turns of every Session in this Host, for attribution between overlapping turns. */
+  turns: RepositoryTurns
   /** Directory that receives each Session's temporary directory. */
   tempRoot: string
   /** Maximum files carried by one summary. */
@@ -69,6 +72,8 @@ interface TurnRecord {
 /** Everything one turn accumulates; a new turn gets a new object so queued work for an older turn keeps its own. */
 interface TurnState {
   readonly turn: number
+  /** When the turn opened, on the process clock; with the record time it is the window attribution compares. */
+  readonly startedAt: number
   /**
    * The turn-start snapshot once it exists. `null` means no repository or no git, so the turn summarizes file-tool
    * captures only; `'failed'` means the repository exists but its snapshot failed, so the turn records nothing.
@@ -83,8 +88,8 @@ interface TurnState {
   recordedAfterSeq: number
 }
 
-function freshState(turn: number): TurnState {
-  return { turn, baseline: null, captures: new Map(), lastToolResultSeq: -1, attemptedAfterSeq: -1, recordedAfterSeq: -1 }
+function freshState(turn: number, startedAt: number): TurnState {
+  return { turn, startedAt, baseline: null, captures: new Map(), lastToolResultSeq: -1, attemptedAfterSeq: -1, recordedAfterSeq: -1 }
 }
 
 /** A listed file with the sources of its two sides. */
@@ -102,12 +107,14 @@ const OVERSIZED = Symbol('oversized')
  * with the summaries. Tool execution waits for pending work so a snapshot or
  * capture never races a mutation. A working directory outside any repository,
  * or a Host without git, gets no snapshot; its summary lists the files the file
- * tools changed.
+ * tools changed. So does a turn that overlaps another Session's turn on the same
+ * repository: a snapshot diff cannot attribute a change, so nothing the Session
+ * did not capture itself is claimed.
  */
 export class TurnRecorder {
   private chain: Promise<void> = Promise.resolve()
   /** The open turn; before the first `turn/start` it is an empty placeholder no event can match. */
-  private state = freshState(0)
+  private state = freshState(0, 0)
   /** Canonical paths, resolved by the first turn. */
   private paths: Paths | undefined
   /** The located repository, reused across turns once found; null keeps retrying each turn. */
@@ -129,13 +136,15 @@ export class TurnRecorder {
    * @param turn - the turn number from `turn/start`.
    */
   start(turn: number): void {
-    const state = freshState(turn)
+    const state = freshState(turn, Date.now())
     this.state = state
     void this.enqueue(async (signal) => {
       try {
         this.paths ??= { cwd: await realpath(this.cwd), home: await canonicalPath(homedir()), temporaryRoots: await temporaryRoots() }
         const repository = await this.locate(this.paths.cwd, signal)
         if (repository === null) return
+        // Announce the window before the snapshot, so a Session recording inside it sees this turn.
+        this.env.turns.open(repository.workspace.root, this.session, state.startedAt)
         const tree = await snapshotTree(repository.git, repository.workspace, signal)
         state.baseline = { ...repository, tree }
       } catch (error: unknown) {
@@ -193,7 +202,9 @@ export class TurnRecorder {
    */
   end(turn: number): void {
     const state = this.state
-    if (turn !== state.turn || state.attemptedAfterSeq >= state.lastToolResultSeq) return
+    if (turn !== state.turn) return
+    this.closeWindow()
+    if (state.attemptedAfterSeq >= state.lastToolResultSeq) return
     void this.enqueue(signal => this.record(state, signal))
   }
 
@@ -246,6 +257,7 @@ export class TurnRecorder {
   async dispose(): Promise<void> {
     this.lifetime.abort()
     this.records.clear()
+    this.env.turns.forget(this.session)
     await this.chain
     if (this.scratch !== undefined) await rm(await this.scratch, { recursive: true, force: true })
   }
@@ -272,6 +284,12 @@ export class TurnRecorder {
   private scratchDir(): Promise<string> {
     this.scratch ??= mkdtemp(join(this.env.tempRoot, 'dsh-workspace-changes-'))
     return this.scratch
+  }
+
+  /** Close this Session's window on its repository, if it was ever opened. */
+  private closeWindow(): void {
+    const root = this.repository?.workspace.root
+    if (root !== undefined) this.env.turns.close(root, this.session, Date.now())
   }
 
   /** The repository enclosing the working directory, located once; null keeps retrying each turn. */
@@ -307,18 +325,25 @@ export class TurnRecorder {
     state.attemptedAfterSeq = state.lastToolResultSeq
     // Without a snapshot the working directory itself bounds the workspace.
     const root = baseline?.workspace.root ?? paths.cwd
+    // A snapshot says what changed, never who changed it. While another Session's turn
+    // overlaps this one, every snapshot entry inside the overlap is ambiguous, so the
+    // turn claims only the paths its own file tools captured and apportions nothing else.
+    const snapshotted = baseline !== null
+      && !this.env.turns.overlaps(baseline.workspace.root, this.session, state.startedAt, Date.now())
+      ? baseline
+      : null
     const listed = new Map<string, Listed>()
     let snapshot: WorkspaceChangesSummary['snapshot']
-    if (baseline !== null) {
-      const after = await snapshotTree(baseline.git, baseline.workspace, signal)
-      snapshot = { before: baseline.tree, after }
-      const repository: Repository = { git: baseline.git, workspace: baseline.workspace }
-      for (const entry of await diffTrees(baseline.git, baseline.workspace, baseline.tree, after, signal)) {
+    if (snapshotted !== null) {
+      const after = await snapshotTree(snapshotted.git, snapshotted.workspace, signal)
+      snapshot = { before: snapshotted.tree, after }
+      const repository: Repository = { git: snapshotted.git, workspace: snapshotted.workspace }
+      for (const entry of await diffTrees(snapshotted.git, snapshotted.workspace, snapshotted.tree, after, signal)) {
         const absolute = resolve(root, entry.path)
         listed.set(absolute, {
           file: changedFile(paths, root, absolute, entry),
           sources: entry.binary ? { refusal: 'binary' } : {
-            before: { kind: 'snapshot', repository, tree: baseline.tree, path: entry.oldPath ?? entry.path },
+            before: { kind: 'snapshot', repository, tree: snapshotted.tree, path: entry.oldPath ?? entry.path },
             after: { kind: 'snapshot', repository, tree: after, path: entry.path },
           },
         })
@@ -328,15 +353,15 @@ export class TurnRecorder {
     const captured = [...state.captures.keys()].filter(absolute => !listed.has(absolute))
     const workTreePath = (absolute: string): string => toPosix(relative(root, absolute))
     let inWorkspace = captured.filter(absolute => isInside(root, absolute))
-    if (baseline !== null && inWorkspace.length > 0) {
+    if (snapshotted !== null && inWorkspace.length > 0) {
       // Nested repositories and submodules are gitlinks: their contents never enter the summary.
-      const gitlinks = await gitlinkPaths(baseline.git, baseline.workspace, signal)
+      const gitlinks = await gitlinkPaths(snapshotted.git, snapshotted.workspace, signal)
       inWorkspace = inWorkspace.filter(absolute => ![...gitlinks].some(link => isInside(resolve(root, link), absolute)))
     }
     // A snapshot covers every workspace file except the ignored ones; without one, every file-tool edit counts.
-    const uncoveredInWorkspace = baseline === null
+    const uncoveredInWorkspace = snapshotted === null
       ? new Set(inWorkspace.map(workTreePath))
-      : await ignoredPaths(baseline.git, baseline.workspace, inWorkspace.map(workTreePath), signal)
+      : await ignoredPaths(snapshotted.git, snapshotted.workspace, inWorkspace.map(workTreePath), signal)
     for (const absolute of captured) {
       // Outside the workspace, scratch files under a temporary root stay out.
       const uncovered = isInside(root, absolute)

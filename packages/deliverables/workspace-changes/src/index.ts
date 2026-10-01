@@ -6,7 +6,9 @@
  * announced by a `workspace/changes` Session event that carries only the turn
  * number; summaries and comparisons are served through the `workspaceChanges`
  * service until the Session is disposed. Outside a git repository, or without
- * git, the summary lists file-tool edits only.
+ * git, the summary lists file-tool edits only. So does a turn that overlaps
+ * another Session's turn on the same repository: a snapshot diff cannot say
+ * which Session wrote a change, and a Session never claims another one's work.
  */
 import { homedir, tmpdir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
@@ -17,6 +19,7 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import { GitRunner } from './git.ts'
 import { TurnRecorder } from './recorder.ts'
+import { RepositoryTurns } from './turns.ts'
 import type { WorkspaceChanges } from './types.ts'
 
 export type {
@@ -101,6 +104,8 @@ export function apply(ctx: Context, config: Config): void {
   const lifetime = new AbortController()
   const recorders = new Map<Session, TurnRecorder>()
   const byId = new Map<SessionId, TurnRecorder>()
+  /** The Host's live turns; one registry attributes every recorder against the others. */
+  const turns = new RepositoryTurns()
   const forget = (session: Session): Promise<void> => {
     const recorder = recorders.get(session)
     recorders.delete(session)
@@ -131,7 +136,7 @@ export function apply(ctx: Context, config: Config): void {
     let recorder = recorders.get(session)
     if (recorder === undefined) {
       recorder = new TurnRecorder(session, cwd, {
-        git: gitRunner(), tempRoot: tmpdir(), maxFiles: config.maxFiles,
+        git: gitRunner(), turns, tempRoot: tmpdir(), maxFiles: config.maxFiles,
         maxFileBytes: config.maxFileBytes, diffTimeoutMs: config.diffTimeoutMs,
         warn: (message) => { ctx.logger.warn(message) },
       })
